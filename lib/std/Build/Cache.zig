@@ -1366,6 +1366,11 @@ pub const Manifest = struct {
                 return .hit;
         }
 
+        // Hashing the file below overwrites `disk_file.digest`. Without a
+        // digest from the caller, `input_file.digest` was never computed, so
+        // the contents are compared to the digest the manifest recorded.
+        const expected_digest: BinDigest = if (input_path.have_digest) input_file.digest else disk_file.digest;
+
         if (input_path.have_stat) {
             const changed = try disk_file.setStatChanged(m, input_file.stat());
             if (!changed) return .hit;
@@ -1420,7 +1425,7 @@ pub const Manifest = struct {
             hasher.update(file_or_dir_contents);
             hasher.final(&disk_file.digest);
 
-            if (mem.eql(u8, &disk_file.digest, &input_file.digest)) return .hit;
+            if (mem.eql(u8, &disk_file.digest, &expected_digest)) return .hit;
             return .{ .contents_changed = file_off };
         }
 
@@ -1471,7 +1476,7 @@ pub const Manifest = struct {
                 .populated => unreachable,
             };
 
-            if (mem.eql(u8, &disk_file.digest, &input_file.digest)) return .hit;
+            if (mem.eql(u8, &disk_file.digest, &expected_digest)) return .hit;
             return .{ .contents_changed = file_off };
         } else {
             const opened_file = if (input_path.have_handle)
@@ -1525,7 +1530,7 @@ pub const Manifest = struct {
                 .populated => unreachable,
             }
 
-            if (mem.eql(u8, &disk_file.digest, &input_file.digest)) return .hit;
+            if (mem.eql(u8, &disk_file.digest, &expected_digest)) return .hit;
             return .{ .contents_changed = file_off };
         }
     }
@@ -2483,6 +2488,98 @@ test "check that changing a file causes cache miss" {
 
         try testing.expect(!mem.eql(u8, &digest1, &digest2));
     }
+}
+
+fn testSameContentsNewInode(request_contents: bool) !void {
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    const temp_file = "same_contents_new_inode.txt";
+    const replacement = "same_contents_new_inode.txt.new";
+    const temp_manifest_dir = "same_contents_new_inode_manifest_dir";
+    const temp_file_contents = "Hello, world!\n";
+
+    try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = temp_file_contents });
+    const tmp_directory: Directory = .{
+        .path = try std.fs.path.join(testing.allocator, &.{std.testing.TmpDir.parent_dir_path}),
+        .handle = tmp.dir,
+    };
+    defer testing.allocator.free(tmp_directory.path.?);
+
+    // Wait for file timestamps to tick
+    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
+    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
+        try Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+    }
+
+    var digest1: HexDigest = undefined;
+    var digest2: HexDigest = undefined;
+
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(tmp_directory);
+    defer cache.manifest_dir.close(io);
+
+    {
+        var man = cache.obtain();
+        defer man.deinit();
+
+        man.hash.addBytes("1234");
+        _ = try man.addInputPath(.{
+            .root_dir = tmp_directory,
+            .sub_path = temp_file,
+        }, .{ .request_contents = request_contents });
+
+        var diag: Manifest.CheckDiagnostic = undefined;
+        try testing.expectEqual(.incomplete_manifest, try man.check(&diag, .none));
+
+        digest1 = man.missDigestHex();
+        try man.finalize();
+    }
+
+    // The same bytes under a new inode, as a checkout or a restored cache
+    // archive writes them.
+    try tmp.dir.writeFile(io, .{ .sub_path = replacement, .data = temp_file_contents });
+    try tmp.dir.rename(replacement, tmp.dir, temp_file, io);
+
+    {
+        var man = cache.obtain();
+        defer man.deinit();
+
+        man.hash.addBytes("1234");
+        const temp_file_idx = try man.addInputPath(.{
+            .root_dir = tmp_directory,
+            .sub_path = temp_file,
+        }, .{ .request_contents = request_contents });
+
+        // Only the file's metadata changed: its contents still match the manifest.
+        var diag: Manifest.CheckDiagnostic = undefined;
+        try testing.expectEqual(.hit, try man.check(&diag, .none));
+        if (request_contents) {
+            try testing.expectEqualStrings(temp_file_contents, temp_file_idx.contents(&man));
+        }
+        digest2 = man.hitDigestHex();
+    }
+
+    try testing.expectEqual(digest1, digest2);
+}
+
+test "a file rewritten with the same contents is a cache hit" {
+    try testSameContentsNewInode(false);
+}
+
+test "a file rewritten with the same contents is a cache hit, its contents requested" {
+    try testSameContentsNewInode(true);
 }
 
 test "no file inputs" {
