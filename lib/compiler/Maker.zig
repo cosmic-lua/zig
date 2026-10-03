@@ -4057,7 +4057,7 @@ fn findBuildRoot(arena: Allocator, io: Io, options: FindBuildRootOptions) !Build
 
         return .{
             .build_zig_basename = build_zig_basename,
-            .directory = .cwd(),
+            .directory = .{ .path = options.cwd_path, .handle = Io.Dir.cwd() },
             .close_directory = false,
         };
     }
@@ -4078,7 +4078,9 @@ fn findBuildRoot(arena: Allocator, io: Io, options: FindBuildRootOptions) !Build
             return .{
                 .build_zig_basename = build_zig_basename,
                 .directory = .{
-                    .path = dirname,
+                    // A root with no path is never a cache prefix, so the
+                    // cache would key every file under it by its absolute path.
+                    .path = dirname orelse options.cwd_path,
                     .handle = dir,
                 },
                 .close_directory = dirname != null,
@@ -4266,6 +4268,23 @@ fn sanitizeExampleName(arena: Allocator, bytes: []const u8) error{OutOfMemory}![
         result.shrinkRetainingCapacity(Package.Manifest.max_name_len);
 
     return result.toOwnedSlice(arena);
+}
+
+test findBuildRoot {
+    const io = std.testing.io;
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    // A build file named without a directory is in the working directory,
+    // whose path the build root takes so the cache keys files relative to it.
+    var build_root = try findBuildRoot(arena, io, .{
+        .build_file = "build.zig",
+        .cwd_path = "/working/directory",
+    });
+    defer build_root.deinit(io);
+    try std.testing.expectEqualStrings("/working/directory", build_root.directory.path.?);
+    try std.testing.expectEqualStrings("build.zig", build_root.build_zig_basename);
 }
 
 test sanitizeExampleName {
